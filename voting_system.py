@@ -3,203 +3,272 @@ import os
 import sys
 from paillier_core import PaillierCipher
 
-# 模拟的文件名，代表网络传输的数据包
+# --- 文件配置 ---
 PUB_KEY_FILE = "network_public_key.json"
 PRIV_KEY_FILE = "offline_private_key.json"
 BALLOT_BOX_FILE = "network_ballot_box.json"
 RESULT_FILE = "network_encrypted_result.json"
+CONFIG_FILE = "election_config.json"  # 新增：存储候选人名单
+
+# --- 核心参数 ---
+# 每个候选人预留的位数基数。
+# 1000 代表每个候选人最多可以接受 999 票而不发生进位溢出。
+# 原理：Vote_Value = SLOT_SIZE ^ (Candidate_Index)
+SLOT_SIZE = 1000
 
 
 def clean_screen():
-    # 简单的清屏，让演示更像个系统
     os.system('cls' if os.name == 'nt' else 'clear')
 
 
 def save_json(filename, data):
-    with open(filename, 'w') as f:
-        json.dump(data, f, indent=4)
-    print(f"  [传输] 数据已写入 {filename}")
+    with open(filename, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+    print(f"  [存储] 数据已更新至 {filename}")
 
 
 def load_json(filename):
     try:
-        with open(filename, 'r') as f:
+        with open(filename, 'r', encoding='utf-8') as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"错误：找不到文件 {filename}，请先运行上一步骤。")
-        sys.exit(1)
+        print(f"\n[错误] 找不到文件 {filename}。请按照步骤顺序执行程序。")
+        return None
 
 
-# --- 角色 1: 权威机构 (初始化) ---
+# --- Step 0: 配置选举 (定义候选人) ---
+def configure_election():
+    clean_screen()
+    print("=== Step 0: 选举参数配置 (Admin) ===")
+    print("在此步骤，我们将定义本次选举的候选人名单。\n")
+
+    candidates = []
+    max_candidates = 5  # 你可以在这里设定最大数量限制
+
+    print(f"请输入候选人姓名 (最多 {max_candidates} 人)。")
+    print("直接按回车键结束录入。\n")
+
+    while len(candidates) < max_candidates:
+        name = input(f"请输入第 {len(candidates) + 1} 位候选人姓名: ").strip()
+        if not name:
+            if len(candidates) < 2:
+                print("错误：至少需要 2 位候选人才能开始选举。")
+                continue
+            break
+        candidates.append(name)
+        print(f"  -> 已添加: {name}")
+
+    config_data = {
+        "candidates": candidates,
+        "slot_size": SLOT_SIZE
+    }
+    save_json(CONFIG_FILE, config_data)
+
+    print("\n[配置完成] 候选人名单已生成。")
+    input("按回车键返回主菜单...")
+
+
+# --- Step 1: 权威机构初始化 ---
 def setup_election():
     clean_screen()
-    print("=== 角色 1: 权威机构 (Trusted Authority) ===")
-    print("正在初始化选举系统密钥...")
+    print("=== Step 1: 权威机构初始化 (Trusted Authority) ===")
 
-    # 实例化并生成密钥
-    cipher = PaillierCipher(key_size=128)  # 演示可以用大一点的 key
+    # 检查是否已配置
+    if not os.path.exists(CONFIG_FILE):
+        print("错误：尚未配置候选人。请先执行 Step 0。")
+        input("按回车返回...")
+        return
 
-    # 序列化公钥 (n, g)
-    pub_data = {"n": cipher.n, "g": cipher.g}
-    save_json(PUB_KEY_FILE, pub_data)
+    print("正在生成 Paillier 密钥对 (这可能需要几秒钟)...")
+    # 生成密钥
+    cipher = PaillierCipher(key_size=128, generate_keys=True)
 
-    # 序列化私钥 (lambda, mu) - 注意：这个文件应该被严密保护
-    priv_data = {"lam": cipher.lam, "mu": cipher.mu, "n": cipher.n}
-    save_json(PRIV_KEY_FILE, priv_data)
-
-    # 初始化空的投票箱
+    # 保存公钥
+    save_json(PUB_KEY_FILE, {"n": cipher.n, "g": cipher.g})
+    # 保存私钥
+    save_json(PRIV_KEY_FILE, {"lam": cipher.lam, "mu": cipher.mu, "n": cipher.n})
+    # 初始化空票箱
     save_json(BALLOT_BOX_FILE, [])
 
-    print("\n[系统状态] 选举已开始！公钥已发布到网络，私钥已离线存储。")
-    input("\n按回车键进入下一步：选民投票...")
+    print("\n[系统就绪] 密钥分发完毕，票箱已重置。")
+    input("按回车键进入下一步：选民投票...")
 
 
-# --- 角色 2: 选民 (客户端) ---
+# --- Step 2: 选民投票 (多选一逻辑) ---
 def voter_action():
     clean_screen()
-    print("=== 角色 2: 选民客户端 (Voter Client) ===")
-    print("正在从网络获取公钥...")
-    print("1")
-    pub_data = load_json(PUB_KEY_FILE)
-    print("1")
+    print("=== Step 2: 选民客户端 (Voter Client) ===")
 
-    # 临时重建一个只有公钥的 Cipher 对象
-    # 这里我们hack一下，只用 n 和 g，不需要私钥
+    pub_data = load_json(PUB_KEY_FILE)
+    config = load_json(CONFIG_FILE)
+    if not pub_data or not config: return
+
+    candidates = config['candidates']
+
+    # 重建只含公钥的 Cipher
     cipher = PaillierCipher(generate_keys=False)
     cipher.n = pub_data['n']
     cipher.g = pub_data['g']
     cipher.n_sq = cipher.n ** 2
 
-    print("-" * 40)
-    print("候选人名单: ")
-    print("  1. Alice (输入 1)")
-    print("  0. Bob   (输入 0)")
-    print("-" * 40)
-
     ballots = load_json(BALLOT_BOX_FILE)
 
     while True:
-        choice = input("请输入你的选择 (1/0)，输入 'q' 结束投票: ")
+        print(f"\n当前票箱内已有 {len(ballots)} 张选票。")
+        print("-" * 40)
+        print("候选人名单:")
+        for idx, name in enumerate(candidates):
+            print(f"  [{idx}] {name}")
+        print("-" * 40)
+
+        choice = input("请输入候选人编号进行投票 (输入 'q' 结束并上传): ")
         if choice.lower() == 'q':
             break
-        if choice not in ['0', '1']:
-            print("无效输入，请重试。")
+
+        if not choice.isdigit():
+            print("输入无效，请输入数字。")
             continue
 
-        val = int(choice)
+        idx = int(choice)
+        if idx < 0 or idx >= len(candidates):
+            print("编号超出范围，请重试。")
+            continue
 
-        # 加密
-        print(f"正在加密选票 [{val}] ...")
-        c = cipher.encrypt(val)
+        # === 核心：多路编码逻辑 ===
+        # 选第0人 -> m = 1
+        # 选第1人 -> m = 1000
+        # 选第2人 -> m = 1000000
+        m = pow(SLOT_SIZE, idx)
 
-        # 将大整数转为字符串存储，模拟发包
+        print(f"正在加密选票 (对应明文数值: {m})...")
+        c = cipher.encrypt(m)
         ballots.append(str(c))
-        print(f"  -> 密文生成: {str(c)[:10]}... (已发送至云端)")
+        print("  -> 投票成功！密文已存入缓存。")
 
     save_json(BALLOT_BOX_FILE, ballots)
-    print(f"\n[系统状态] 所有选票已加密上传。当前票箱共 {len(ballots)} 张票。")
-    input("\n按回车键进入下一步：云端计票...")
+    print("\n[上传成功] 所有选票已同步至网络票箱。")
+    input("按回车键进入下一步：云端计票...")
 
 
-# --- 角色 3: 云端服务器 (不掌握私钥) ---
+# --- Step 3: 云端计票 (不变，依然是纯加法) ---
 def cloud_server_tally():
     clean_screen()
-    print("=== 角色 3: 云端计票服务器 (Untrusted Cloud) ===")
-    print("警告：本服务器没有私钥，无法查看具体选票内容。")
-    print("正在执行同态运算...")
+    print("=== Step 3: 云端计票服务器 (Untrusted Cloud) ===")
 
     pub_data = load_json(PUB_KEY_FILE)
     ballots = load_json(BALLOT_BOX_FILE)
 
-    if not ballots:
-        print("票箱为空！")
+    if not pub_data or not ballots:
+        print("缺少数据，无法计票。")
+        input("按回车返回...");
         return
 
-    # 重建只有公钥的 Cipher
+    print(f"接收到 {len(ballots)} 张加密选票。")
+    print("正在进行同态聚合 (Homomorphic Addition)...")
+
     cipher = PaillierCipher(generate_keys=False)
     cipher.n = pub_data['n']
     cipher.n_sq = cipher.n ** 2
 
-    # 开始同态加法 (密文乘积)
-    # 初始值设为加密的 0，或者直接取第一个密文
-    # 为了严谨，我们取第一个，然后累乘后面的
-    encrypted_sum = int(ballots[0])
+    if len(ballots) == 0:
+        encrypted_sum = 0  # 处理空票箱
+    else:
+        encrypted_sum = int(ballots[0])
+        for i in range(1, len(ballots)):
+            c_next = int(ballots[i])
+            encrypted_sum = cipher.homomorphic_add(encrypted_sum, c_next)
+            # 简单的进度条
+            if i % 5 == 0: print(f"  ...处理进度: {i}/{len(ballots)}")
 
-    print(f"正在处理第 1/{len(ballots)} 张选票...")
-
-    for i in range(1, len(ballots)):
-        c_next = int(ballots[i])
-        encrypted_sum = cipher.homomorphic_add(encrypted_sum, c_next)
-        print(f"正在处理第 {i + 1}/{len(ballots)} 张选票... (同态聚合中)")
-
-    print("\n计算完成！")
-    print(f"聚合后的密文结果: {str(encrypted_sum)[:20]}...")
+    print("\n[计算完成] 聚合密文已生成。")
+    print(f"密文片段: {str(encrypted_sum)[:30]}...")
 
     save_json(RESULT_FILE, {"encrypted_sum": str(encrypted_sum)})
-    input("\n按回车键进入下一步：公布结果...")
+    input("按回车键进入下一步：结果解密...")
 
 
-# --- 角色 1 (回归): 权威机构解密 ---
+# --- Step 4: 结果揭晓 (解码逻辑) ---
 def reveal_result():
     clean_screen()
-    print("=== 角色 1: 权威机构 (Trusted Authority) ===")
-    print("收到云端计算结果，正在取出私钥进行解密...")
+    print("=== Step 4: 权威机构解密与公示 (Authority) ===")
 
     priv_data = load_json(PRIV_KEY_FILE)
     result_data = load_json(RESULT_FILE)
+    config = load_json(CONFIG_FILE)
 
-    # 重建拥有私钥的 Cipher
+    if not priv_data or not result_data or not config: return
+
+    candidates = config['candidates']
+    slot_size = config['slot_size']
+
+    # 重建含私钥的 Cipher
     cipher = PaillierCipher(generate_keys=False)
     cipher.n = priv_data['n']
     cipher.n_sq = cipher.n ** 2
     cipher.lam = priv_data['lam']
     cipher.mu = priv_data['mu']
 
-    c_sum = int(result_data['encrypted_sum'])
+    print("正在解密聚合密文...")
+    decrypted_total = cipher.decrypt(int(result_data['encrypted_sum']))
 
-    # 解密
-    total_votes = cipher.decrypt(c_sum)
+    print(f"解密后的原始总数 (Encoded Integer): {decrypted_total}")
+    print("-" * 50)
+    print("正在解码选票分布...")
 
-    ballots = load_json(BALLOT_BOX_FILE)
-    total_voters = len(ballots)
-
-    print("\n" + "=" * 40)
-    print("      选举最终结果      ")
-    print("=" * 40)
-    print(f"总参与人数: {total_voters}")
+    # === 核心：结果解码逻辑 ===
+    print(f"\n{'候选人':<10} | {'得票数':<10} | {'可视化'}")
     print("-" * 40)
-    print(f"Alice (1) 得票数: {total_votes}")
-    print(f"Bob (0)   得票数: {total_voters - total_votes}")
-    print("=" * 40)
 
-    # 清理临时文件
-    input("\n演示结束。按回车清理临时文件并退出。")
-    for f in [PUB_KEY_FILE, PRIV_KEY_FILE, BALLOT_BOX_FILE, RESULT_FILE]:
-        if os.path.exists(f):
-            os.remove(f)
-    print("清理完毕。")
+    current_val = decrypted_total
+    total_votes_check = 0
+
+    for name in candidates:
+        # 取余数得到当前位的票数
+        count = current_val % slot_size
+        # 地板除，移位到下一个候选人
+        current_val = current_val // slot_size
+
+        total_votes_check += count
+        bar = "█" * count  # 简单的 ascii 柱状图
+        print(f"{name:<10} | {count:<10} | {bar}")
+
+    print("-" * 40)
+    print(f"总有效票数: {total_votes_check}")
+
+    # 验证是否溢出
+    if current_val > 0:
+        print("\n[警告] 检测到异常数据残留，可能发生了选票溢出攻击！")
+    else:
+        print("\n[验证] 数据完整性校验通过。")
+
+    input("\n按回车键清理数据并退出...")
+    # 清理文件
+    for f in [PUB_KEY_FILE, PRIV_KEY_FILE, BALLOT_BOX_FILE, RESULT_FILE, CONFIG_FILE]:
+        if os.path.exists(f): os.remove(f)
 
 
 if __name__ == "__main__":
-    # 简单的菜单驱动
     while True:
         clean_screen()
-        print("Paillier 同态加密投票系统 - 全流程演示")
+        print("Paillier 多候选人隐私投票系统 v2.0")
+        print("==================================")
+        print("0. [Step 0] 配置候选人 (Admin)")
         print("1. [Step 1] 初始化密钥 (Authority)")
         print("2. [Step 2] 选民投票 (Client)")
         print("3. [Step 3] 云端计票 (Cloud Server)")
         print("4. [Step 4] 结果解密 (Authority)")
-        print("0. 退出")
+        print("x. 退出程序")
 
-        choice = input("\n请按顺序选择步骤: ")
-
-        if choice == '1':
+        c = input("\n请选择步骤: ")
+        if c == '0':
+            configure_election()
+        elif c == '1':
             setup_election()
-        elif choice == '2':
+        elif c == '2':
             voter_action()
-        elif choice == '3':
+        elif c == '3':
             cloud_server_tally()
-        elif choice == '4':
+        elif c == '4':
             reveal_result()
-        elif choice == '0':
+        elif c.lower() == 'x':
             break
